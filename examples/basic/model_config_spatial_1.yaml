@@ -6,7 +6,7 @@ gpu_memory_utilization: 0.5
 models:
   -
     name: llm-0
-    model: /mnt/afs/share/LLMCKPTs/huggyllama/llama-13b
+    model: /data/lrc/workspace/huggyllama/llama-7b
     tensor_parallel_size: 1
     pipeline_parallel_size: 1
     placement:

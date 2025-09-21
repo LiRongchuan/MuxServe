@@ -19,8 +19,8 @@ import pickle
 import os
 
 DEFAULT_WARMUP = 10
-DEFAULT_DATASET_PATH = "/mnt/afs/dmhj/datasets/ShareGPT_V3_unfiltered_cleaned_split.json"
-DEFAULT_TOKENIZER_PATH = "/mnt/afs/share/LLMCKPTs/huggyllama/llama-7b"
+DEFAULT_DATASET_PATH = "/data/lrc/workspace/dataset/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"
+DEFAULT_TOKENIZER_PATH = "/data/lrc/workspace/huggyllama/llama-7b"
 eps = 1e-6
 
 
@@ -744,7 +744,7 @@ if __name__ == "__main__":
     # parser.add_argument("--model", type=str, default="llama-7b")
     parser.add_argument("--uneven_distribution", type=bool, default=False)
     parser.add_argument("--workload_info_from_yaml", type=bool, default=False)
-    parser.add_argument("--dataset-source", type=str, default="/mnt/afs/lurunyu/data/ShareGPT_V3_unfiltered_cleaned_split.json", help="the dataset source, like sharedgpt")
+    parser.add_argument("--dataset-source", type=str, default="/workspace/dataset/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json", help="the dataset source, like sharedgpt")
     parser.add_argument("--model-yaml", type=str, default="examples/basic/models.yaml", help="the model yaml to generate the workload, refer to `examples/basic/models.yaml`")
     parser.add_argument("--output-file", type=str, default=None, help="the dataset source, like sharedgpt")
     args = parser.parse_args()
