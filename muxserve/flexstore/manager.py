@@ -23,40 +23,43 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
 def replace_numbers_with_value(s: str, replacement_value: int):
+    """ 将所有数字替换为指定值 """
     regex_pattern = r'\d+'
     result = re.sub(regex_pattern, str(replacement_value), s)
     return result
 
 
 def grasp_num(s: str):
+    """ 提取字符串首个数字并转换为int """
     regex_pattern = r'\d+'
     result = re.findall(regex_pattern, s)
     return int(result[0])
 
 
 class WeightStorage:
-
+    """ 管理模型权重 """
     # FIXME: Add a parameter to specify the dataType, maybe as a filed of `JobConfig`
     def __init__(self, weights: Dict[str, torch.Tensor], job_config: JobConfig,
                  model_config: PretrainedConfig, rank_start: int,
                  rank_end: int) -> None:
         # FIXME: dp is not taken into consideration
-        placement = job_config.placement[0]
-        self.dtype = job_config.model_dtype
+        placement = job_config.placement[0] # 放置在哪些GPU上
+        self.dtype = job_config.model_dtype # 如torch.float16
         logger.info(
+            # 例：load_weight: /huggyllama/llama-7b; placement, dtype: [0, 1], torch.float16
             f"load_weight: {job_config.model}; placement, dtype: {placement}, {self.dtype}"
         )
+        """ {GPU id: {权重名称: 权重/元数据}} """
         # for world_size `P`, we have {weight_name: [weight_1, weight_2, ..., weight_P]}
-        self.data: Dict[int, Dict[str,
-                                  torch.Tensor]] = {k: {}
-                                                    for k in placement}
+        self.data: Dict[int, Dict[str, torch.Tensor]] = {k: {} for k in placement}
         # meta_data to rebuild tensors; {rank: {weight_name: meta_data}}
         self.metadata: Dict[int, Dict[str, Dict]] = {k: {} for k in placement}
 
-        reshaped_weights = WeightStorage.reshape_weights(
-            weights, job_config, model_config)
-        tp_size = job_config.tensor_parallel_size
-        pp_size = job_config.pipeline_parallel_size
+        reshaped_weights = WeightStorage.reshape_weights(weights, job_config, model_config)
+        
+        # tp_size * pp_size < total_GPU
+        tp_size = job_config.tensor_parallel_size # 层内的并行性，单个张量用tp个GPU计算
+        pp_size = job_config.pipeline_parallel_size # 层间的并行性，不同层按流水线由不同GPU（组）计算
         if model_config.model_type == "llama":
             '''
             VocabParallelEmbedding: column [vocab, hidden]
@@ -208,8 +211,7 @@ class WeightStorage:
                    rank_start, rank_end)
 
     @staticmethod
-    def reshape_weights(weights: Dict[str, torch.Tensor],
-                        job_config: JobConfig, model_config: PretrainedConfig):
+    def reshape_weights(weights: Dict[str, torch.Tensor], job_config: JobConfig, model_config: PretrainedConfig):
         '''
         For Llama, this method will cat [w_q,w_k,w_v] and [w_gate, w_up]
         '''
@@ -217,22 +219,23 @@ class WeightStorage:
         weights_copy = copy.deepcopy(weights)
 
         if model_config.model_type == "llama":
-            q_proj_shard_size = (model_config.hidden_size // tp_size)
-            num_kv_heads_replicas = max(
-                1, tp_size // model_config.num_key_value_heads)
-            num_kv_heads_per_gpu = max(
-                1, model_config.num_key_value_heads // tp_size)
-            kv_proj_shard_size = (model_config.hidden_size //
-                                  model_config.num_attention_heads *
-                                  num_kv_heads_per_gpu)
+            q_proj_shard_size = (model_config.hidden_size // tp_size) # 单个GPU处理的维度
+            # tp较大时，每个KV头在多个GPU上计算，需要复制KV头
+            num_kv_heads_replicas = max(1, tp_size // model_config.num_key_value_heads)
+            # tp较小时，每个GPU上分为多个KV头，KV头需要共享GPU
+            num_kv_heads_per_gpu = max(1, model_config.num_key_value_heads // tp_size)
+            # GQA中，合并KV的大小为(hidden_size, head_dim * KV_num)，其中head_dim = hidden_size // Q_head_num
+            # 因此张量并行时，每个GPU处理一部分KV头，分到的KV权重为(hidden_size, head_dim * KV_num_per_GPU)
+            kv_proj_shard_size = (model_config.hidden_size // model_config.num_attention_heads * num_kv_heads_per_gpu)
+            # 将QKV权重拼接成大矩阵，offset为在大矩阵中的偏移量，[ Q | K | V ] = X [ W_Q | W_K | W_V ]
+            # 单个GPU只用关注部分[ Q | K | V ]，因此使用shard_size计算部分输出
             attn_weight_specs = [
                 # (weight_name, shard_size, offset)
                 ("q_proj", q_proj_shard_size, 0),
                 ("k_proj", kv_proj_shard_size, q_proj_shard_size),
-                ("v_proj", kv_proj_shard_size,
-                 q_proj_shard_size + kv_proj_shard_size),
+                ("v_proj", kv_proj_shard_size, q_proj_shard_size + kv_proj_shard_size),
             ]
-            per_rank_qkv_proj_size = q_proj_shard_size + kv_proj_shard_size * 2
+            per_rank_qkv_proj_size = q_proj_shard_size + kv_proj_shard_size * 2 # 单个GPU权重总输出维度
             gate_up_shard_size = model_config.intermediate_size // tp_size
             per_rank_gate_up_proj_size = gate_up_shard_size * 2
             # print(f"tp_size: {tp_size}")
