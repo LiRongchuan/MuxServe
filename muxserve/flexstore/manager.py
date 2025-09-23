@@ -214,6 +214,12 @@ class WeightStorage:
     def reshape_weights(weights: Dict[str, torch.Tensor], job_config: JobConfig, model_config: PretrainedConfig):
         '''
         For Llama, this method will cat [w_q,w_k,w_v] and [w_gate, w_up]
+        Llama使用GQA，Q的切片和KV的切片大小不同
+        Llama的MLP层结构为down_proj(gate(X) * swish(up_proj(X)))
+        gate：门控投影，[hidden_size, intermediate_size]
+        up_proj：上采样投影，[hidden_size, intermediate_size]
+        swish：激活函数
+        down_proj：下采样投影，[intermediate_size, hidden_size]
         '''
         tp_size = job_config.tensor_parallel_size
         weights_copy = copy.deepcopy(weights)
@@ -235,38 +241,37 @@ class WeightStorage:
                 ("k_proj", kv_proj_shard_size, q_proj_shard_size),
                 ("v_proj", kv_proj_shard_size, q_proj_shard_size + kv_proj_shard_size),
             ]
-            per_rank_qkv_proj_size = q_proj_shard_size + kv_proj_shard_size * 2 # 单个GPU权重总输出维度
-            gate_up_shard_size = model_config.intermediate_size // tp_size
-            per_rank_gate_up_proj_size = gate_up_shard_size * 2
+            per_rank_qkv_proj_size = q_proj_shard_size + kv_proj_shard_size * 2 # 单个GPU Attention总输出维度
+            gate_up_shard_size = model_config.intermediate_size // tp_size # 单个GPU MLP中间层维度
+            per_rank_gate_up_proj_size = gate_up_shard_size * 2 # 单个GPU MLP投影矩阵总维度
             # print(f"tp_size: {tp_size}")
             # print(f"q_proj_shard_size: {q_proj_shard_size}")
             # print(f"kv_proj_shard_size: {kv_proj_shard_size}")
             # print(f"per_rank_qkv_proj_size: {per_rank_qkv_proj_size}")
             # print(f"per_rank_gate_up_proj_size: {per_rank_gate_up_proj_size}")
             for name, loaded_weight in weights.items():
+                # 旋转位置编码，不需要依赖权重文件加载
                 if "rotary_emb.inv_freq" in name:
                     del weights_copy[name]
                     continue
-
+                
                 # q_proj: [q_num_heads*head_dim, hidden], k/v_proj: [k/v_num_heads*head_dim, hidden]
                 # cat qkv along the 1st dim: [(2*kv_num_heads+q_num_heads)*head_dim, hidden]
                 is_attn_weight = False
                 for wname, shard_size, offset in attn_weight_specs:
-                    if wname not in name:
+                    if wname not in name: # 权重是否为q_proj，k_proj，v_proj之一
                         continue
                     cat_weight_name = name.replace(wname, "qkv_proj")
                     # 1. initialization
                     if cat_weight_name not in weights_copy:
                         weights_copy[cat_weight_name] = torch.empty(
-                            ((q_proj_shard_size + 2 * kv_proj_shard_size) *
-                             tp_size, model_config.hidden_size),
+                            (per_rank_qkv_proj_size * tp_size, model_config.hidden_size),
                             dtype=torch.float16)
-
                     # 2. copy values
                     cat_weight = weights_copy[cat_weight_name]
                     for tp_rank in range(tp_size):
                         if wname in ["k_proj", "v_proj"]:
-                            shard_id = tp_rank // num_kv_heads_replicas
+                            shard_id = tp_rank // num_kv_heads_replicas # 可能多个GPU共用KV头
                         else:
                             shard_id = tp_rank
                         # print(
@@ -274,13 +279,10 @@ class WeightStorage:
                         #     f"{cat_weight_name} [{offset+(tp_rank*per_rank_qkv_proj_size)}:"
                         #     f"{offset+shard_size+(tp_rank*per_rank_qkv_proj_size)}]\n"
                         # )
-                        cat_weight[offset +
-                                   (tp_rank * per_rank_qkv_proj_size):offset +
-                                   shard_size +
-                                   (tp_rank * per_rank_qkv_proj_size)].copy_(
-                                       loaded_weight[shard_size *
-                                                     shard_id:shard_size *
-                                                     (shard_id + 1)])
+                        # 根据q/k/v偏移和tp偏移复制到相应位置
+                        tp_offset = tp_rank * per_rank_qkv_proj_size
+                        cat_weight[offset + tp_offset: offset + tp_offset + shard_size].copy_(
+                                       loaded_weight[shard_size * shard_id: shard_size * (shard_id + 1)]) # q/k/v矩阵在该GPU上的切片
                     del weights_copy[name]
                     is_attn_weight = True
                     break
@@ -300,7 +302,6 @@ class WeightStorage:
                             (loaded_weight.shape[0] * 2,
                              loaded_weight.shape[1]),
                             dtype=torch.float16)
-
                     # 2. copy values
                     cat_weight = weights_copy[cat_weight_name]
                     shard_size = gate_up_shard_size
@@ -310,22 +311,17 @@ class WeightStorage:
                         #     f"{cat_weight_name} [{stride_id*shard_size + tp_rank*shard_size*2}:"
                         #     f"{(stride_id+1)*shard_size+tp_rank*shard_size*2}]\n"
                         # )
-                        cat_weight[stride_id * shard_size +
-                                   (tp_rank * per_rank_gate_up_proj_size):
-                                   (stride_id + 1) * shard_size +
-                                   (tp_rank *
-                                    per_rank_gate_up_proj_size)].copy_(
-                                        loaded_weight[shard_size *
-                                                      tp_rank:shard_size *
-                                                      (tp_rank + 1)])
+                        # 根据stride_id偏移和tp偏移复制到相应位置
+                        tp_offset = tp_rank * per_rank_gate_up_proj_size
+                        cat_weight[stride_id * shard_size + tp_offset: (stride_id + 1) * shard_size + tp_offset].copy_(
+                                        loaded_weight[shard_size * tp_rank: shard_size * (tp_rank + 1)]) # 投影矩阵在该GPU上的切片
                     del weights_copy[name]
                     is_gate_up_weight = True
                     break
                 if is_gate_up_weight:
                     continue
         else:
-            raise RuntimeError("Only Llama supported now")
-
+            raise RuntimeError("Only Llama supported now") # 出现非Attention/MLP的层
         return weights_copy
 
 
