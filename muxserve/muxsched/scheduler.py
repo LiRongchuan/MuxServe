@@ -277,7 +277,10 @@ class MuxScheduler:
                         PREEMPT_REQ_NAME_FMT
                 ]:
                     name = fmt.format(model_name, mps_percentage)
-                    close_shared_var(name)
+                    try:
+                        close_shared_var(name)
+                    except FileNotFoundError:
+                        logger.warning(f"Shared variable not found: {name}")
 
         # exit flexstore
         self.tcp_client.send_pyobj(["exit", None])

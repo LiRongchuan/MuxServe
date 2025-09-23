@@ -39,32 +39,31 @@ def grasp_num(s: str):
 class WeightStorage:
     """ 管理模型权重 """
     # FIXME: Add a parameter to specify the dataType, maybe as a filed of `JobConfig`
-    def __init__(self, weights: Dict[str, torch.Tensor], job_config: JobConfig,
-                 model_config: PretrainedConfig, rank_start: int,
-                 rank_end: int) -> None:
+    def __init__(
+            self,
+            weights: Dict[str, torch.Tensor],
+            job_config: JobConfig,
+            model_config: PretrainedConfig,
+            rank_start: int,
+            rank_end: int
+        ) -> None:
         # FIXME: dp is not taken into consideration
         placement = job_config.placement[0] # 放置在哪些GPU上
         self.dtype = job_config.model_dtype # 如torch.float16
-        logger.info(
-            # 例：load_weight: /huggyllama/llama-7b; placement, dtype: [0, 1], torch.float16
-            f"load_weight: {job_config.model}; placement, dtype: {placement}, {self.dtype}"
-        )
-        """ {GPU id: {权重名称: 权重/元数据}} """
-        # for world_size `P`, we have {weight_name: [weight_1, weight_2, ..., weight_P]}
+        logger.info(f"load_weight: {job_config.model}, placement: {placement}, dtype: {self.dtype}")
+        """记录GPU信息：{GPU id: {权重名称: 权重/元数据}}"""
         self.data: Dict[int, Dict[str, torch.Tensor]] = {k: {} for k in placement}
-        # meta_data to rebuild tensors; {rank: {weight_name: meta_data}}
         self.metadata: Dict[int, Dict[str, Dict]] = {k: {} for k in placement}
-
+        """投影矩阵拼接，分片"""
         reshaped_weights = WeightStorage.reshape_weights(weights, job_config, model_config)
-        
+        """计算流水线负载分配"""
         # tp_size * pp_size < total_GPU
         tp_size = job_config.tensor_parallel_size # 层内的并行性，单个张量用tp个GPU计算
-        pp_size = job_config.pipeline_parallel_size # 层间的并行性，不同层按流水线由不同GPU（组）计算
+        pp_size = job_config.pipeline_parallel_size # 层间的并行性，不同层按pipeline由不同GPU（组）计算
         if model_config.model_type == "llama":
             '''
             VocabParallelEmbedding: column [vocab, hidden]
             lm_head: column [vocab, hidden]
-
             input_layernorm: no tp
             post_attn_layernorm: no tp
             MLP:
@@ -75,65 +74,54 @@ class WeightStorage:
                 o_proj: row [num_heads*head_dim, hidden]
             '''
             # for tensor parallel
+            # 输入<输出，对投影输出分片，结果需要拼接
             col_split = ["qkv_proj", "gate_up_proj", "embed_tokens", "lm_head"]
+            # 输入>输出，对投影输入分片，结果需要求和
             row_split = ["down_proj", "o_proj"]
-
             # for pipeline parallel
-            pre_process_weights = ["model.embed_tokens.weight"]
-            post_process_weights = ["model.norm.weight", "lm_head.weight"]
-            # pipeline_partition to save the num of hidden layer of every pipeline stage
-            pipeline_partition: List[int] = PipeWorker.pipeline_split(
-                model_config.num_hidden_layers, pp_size)
-
+            pre_process_weights = ["model.embed_tokens.weight"] # 嵌入层
+            post_process_weights = ["model.norm.weight", "lm_head.weight"] # 归一输出层
+            # 每个pipeline阶段处理的层数
+            pipeline_partition: List[int] = PipeWorker.pipeline_split(model_config.num_hidden_layers, pp_size)
         else:
             raise RuntimeError("Only Llama supported now")
 
         logger.info(f"### Begin to place weights on GPUs ...")
         torch.cuda.synchronize()
-        t1 = time.perf_counter()
+        start_time = time.perf_counter()
         for name, val in reshaped_weights.items():
             is_column_parallel = False
             for p in col_split:
                 if p in name:
-                    shard_size = val.shape[0] // tp_size
+                    shard_size = val.shape[0] // tp_size # Y = WX，对W按行分片，Y = [ W1X | ... | WiX ]^T
                     for idx, dev_idx in enumerate(placement):
-                        if dev_idx < rank_start or dev_idx >= rank_end:
-                            continue
+                        if dev_idx < rank_start or dev_idx >= rank_end: continue
                         local_rank = dev_idx - rank_start
+                        # 计算并行化编号
                         pp_rank = idx // tp_size
                         tp_rank = idx % tp_size
-
-                        pre_process = (pp_rank == 0)
-                        post_process = (pp_rank == pp_size - 1)
-
-                        # for embed_tokens
                         if name in pre_process_weights:
+                            # embed_tokens层必须在pipeline首段
                             mapped_name = name
-                            if not pre_process:
-                                continue
+                            if pp_rank != 0: continue
                         elif name in post_process_weights:
+                            # 归一及输出层必须在pipeline尾段
                             mapped_name = name
-                            if not post_process:
-                                continue
+                            if pp_rank != pp_size - 1: continue
                         else:
+                            # 隐藏层必须在对应pipeline阶段
                             original_layer_idx = grasp_num(name)
                             placed_stage = -1
                             while original_layer_idx >= 0:
                                 mapped_layer_idx = original_layer_idx
                                 placed_stage += 1
-                                original_layer_idx -= pipeline_partition[
-                                    placed_stage]
-                            if placed_stage != pp_rank:
-                                continue
-                            mapped_name = replace_numbers_with_value(
-                                name, mapped_layer_idx)
-
-                        # split along the 1st dim
-                        weight = val[tp_rank * shard_size:(tp_rank + 1) *
-                                     shard_size]
-                        self.data[dev_idx][mapped_name] = weight.to(
-                            f"cuda:{local_rank}", dtype=self.dtype)
-
+                                original_layer_idx -= pipeline_partition[placed_stage]
+                            if pp_rank != placed_stage: continue
+                            # 名称改为阶段内部编号
+                            mapped_name = replace_numbers_with_value(name, mapped_layer_idx)
+                        # 获取第一维分片
+                        weight = val[tp_rank * shard_size: (tp_rank + 1) * shard_size]
+                        self.data[dev_idx][mapped_name] = weight.to(f"cuda:{local_rank}", dtype=self.dtype)
                     is_column_parallel = True
                     break
             if is_column_parallel:
@@ -142,30 +130,26 @@ class WeightStorage:
             is_row_parallel = False
             for p in row_split:
                 if p in name:
-                    shard_size = val.shape[1] // tp_size
+                    shard_size = val.shape[1] // tp_size # Y = WX，对W按列分片，对X按行分片，Y = sum(WiXi)
                     for idx, dev_idx in enumerate(placement):
-                        if dev_idx < rank_start or dev_idx >= rank_end:
-                            continue
+                        if dev_idx < rank_start or dev_idx >= rank_end: continue
                         local_rank = dev_idx - rank_start
+                        # 计算并行化编号
                         pp_rank = idx // tp_size
                         tp_rank = idx % tp_size
+                        # 隐藏层必须在对应pipeline阶段
                         original_layer_idx = grasp_num(name)
                         placed_stage = -1
                         while original_layer_idx >= 0:
                             mapped_layer_idx = original_layer_idx
                             placed_stage += 1
-                            original_layer_idx -= pipeline_partition[
-                                placed_stage]
-                        if placed_stage != pp_rank:
-                            continue
-                        mapped_name = replace_numbers_with_value(
-                            name, mapped_layer_idx)
-
-                        # split along the 2nd dim
-                        weight = val[:, tp_rank * shard_size:(tp_rank + 1) *
-                                     shard_size]
-                        self.data[dev_idx][mapped_name] = weight.to(
-                            f"cuda:{local_rank}", dtype=self.dtype)
+                            original_layer_idx -= pipeline_partition[placed_stage]
+                        if pp_rank != placed_stage: continue
+                        # 名称改为阶段内部编号
+                        mapped_name = replace_numbers_with_value(name, mapped_layer_idx)
+                        # 获取第二维分片
+                        weight = val[:, tp_rank * shard_size: (tp_rank + 1) * shard_size]
+                        self.data[dev_idx][mapped_name] = weight.to(f"cuda:{local_rank}", dtype=self.dtype)
                     is_row_parallel = True
                     break
             if is_row_parallel:
@@ -188,7 +172,7 @@ class WeightStorage:
                                                   dtype=self.dtype)
         torch.cuda.synchronize()
         t2 = time.perf_counter()
-        logger.info(f"### Cost of data transfer(cpu->gpu): {t2-t1:.3f} s")
+        logger.info(f"### Cost of data transfer(cpu->gpu): {t2-start_time:.3f} s")
 
         for dev_id, weight_info in self.data.items():
             for weight_name, weight_val in weight_info.items():
@@ -213,18 +197,14 @@ class WeightStorage:
     @staticmethod
     def reshape_weights(weights: Dict[str, torch.Tensor], job_config: JobConfig, model_config: PretrainedConfig):
         '''
-        For Llama, this method will cat [w_q,w_k,w_v] and [w_gate, w_up]
-        Llama使用GQA，Q的切片和KV的切片大小不同
-        Llama的MLP层结构为down_proj(gate(X) * swish(up_proj(X)))
-        gate：门控投影，[hidden_size, intermediate_size]
-        up_proj：上采样投影，[hidden_size, intermediate_size]
-        swish：激活函数
-        down_proj：下采样投影，[intermediate_size, hidden_size]
+        拼接[w_q, w_k, w_v]和[w_gate, w_up]
+        结果weights[name]中指定权重在指定GPU上的分片，起始位置为tp_offset + proj_offset
         '''
         tp_size = job_config.tensor_parallel_size
         weights_copy = copy.deepcopy(weights)
 
         if model_config.model_type == "llama":
+            """Llama使用GQA，Q的切片和KV的切片大小不同"""
             q_proj_shard_size = (model_config.hidden_size // tp_size) # 单个GPU处理的维度
             # tp较大时，每个KV头在多个GPU上计算，需要复制KV头
             num_kv_heads_replicas = max(1, tp_size // model_config.num_key_value_heads)
@@ -242,6 +222,13 @@ class WeightStorage:
                 ("v_proj", kv_proj_shard_size, q_proj_shard_size + kv_proj_shard_size),
             ]
             per_rank_qkv_proj_size = q_proj_shard_size + kv_proj_shard_size * 2 # 单个GPU Attention总输出维度
+            """        
+            Llama的MLP层结构为down_proj(gate(X) * swish(up_proj(X)))
+            gate：门控投影，[hidden_size, intermediate_size]
+            up_proj：上采样投影，[hidden_size, intermediate_size]
+            swish：激活函数
+            down_proj：下采样投影，[intermediate_size, hidden_size]
+            """
             gate_up_shard_size = model_config.intermediate_size // tp_size # 单个GPU MLP中间层维度
             per_rank_gate_up_proj_size = gate_up_shard_size * 2 # 单个GPU MLP投影矩阵总维度
             # print(f"tp_size: {tp_size}")
@@ -254,35 +241,31 @@ class WeightStorage:
                 if "rotary_emb.inv_freq" in name:
                     del weights_copy[name]
                     continue
-                
                 # q_proj: [q_num_heads*head_dim, hidden], k/v_proj: [k/v_num_heads*head_dim, hidden]
                 # cat qkv along the 1st dim: [(2*kv_num_heads+q_num_heads)*head_dim, hidden]
                 is_attn_weight = False
-                for wname, shard_size, offset in attn_weight_specs:
-                    if wname not in name: # 权重是否为q_proj，k_proj，v_proj之一
+                for weight_name, shard_size, offset in attn_weight_specs:
+                    if weight_name not in name: # 权重是否为q_proj，k_proj，v_proj之一
                         continue
-                    cat_weight_name = name.replace(wname, "qkv_proj")
-                    # 1. initialization
+                    cat_weight_name = name.replace(weight_name, "qkv_proj")
+                    # 1. 初始化[ q_proj | k_proj | v_proj ]
                     if cat_weight_name not in weights_copy:
                         weights_copy[cat_weight_name] = torch.empty(
                             (per_rank_qkv_proj_size * tp_size, model_config.hidden_size),
-                            dtype=torch.float16)
-                    # 2. copy values
+                            dtype=torch.float16
+                        )
+                    # 2. 权重复制
                     cat_weight = weights_copy[cat_weight_name]
                     for tp_rank in range(tp_size):
-                        if wname in ["k_proj", "v_proj"]:
+                        if weight_name in ["k_proj", "v_proj"]:
                             shard_id = tp_rank // num_kv_heads_replicas # 可能多个GPU共用KV头
                         else:
                             shard_id = tp_rank
-                        # print(
-                        #     f"### copy from {name}: [{shard_size * shard_id}:{shard_size*(shard_id+1)}] to "
-                        #     f"{cat_weight_name} [{offset+(tp_rank*per_rank_qkv_proj_size)}:"
-                        #     f"{offset+shard_size+(tp_rank*per_rank_qkv_proj_size)}]\n"
-                        # )
-                        # 根据q/k/v偏移和tp偏移复制到相应位置
+                        # 根据tp偏移加q/k/v偏移复制到相应位置
                         tp_offset = tp_rank * per_rank_qkv_proj_size
-                        cat_weight[offset + tp_offset: offset + tp_offset + shard_size].copy_(
-                                       loaded_weight[shard_size * shard_id: shard_size * (shard_id + 1)]) # q/k/v矩阵在该GPU上的切片
+                        cat_weight[tp_offset + offset: tp_offset + offset + shard_size].copy_(
+                            loaded_weight[shard_id * shard_size: (shard_id + 1) * shard_size]
+                        ) # q/k/v矩阵在该GPU上的切片
                     del weights_copy[name]
                     is_attn_weight = True
                     break
@@ -292,36 +275,32 @@ class WeightStorage:
                 # gate_proj: [intermediate_size, hidden], up_proj: [intermediate_size, hidden]
                 # cat `gate_proj` and `up_proj` along the 1st dim
                 is_gate_up_weight = False
-                for stride_id, wname in enumerate(["gate_proj", "up_proj"]):
-                    if wname not in name:
+                for stride_id, weight_name in enumerate(["gate_proj", "up_proj"]):
+                    if weight_name not in name:
                         continue
-                    cat_weight_name = name.replace(wname, "gate_up_proj")
-                    # 1. initialization
+                    cat_weight_name = name.replace(weight_name, "gate_up_proj")
+                    # 1. 初始化[ gate_proj | up_proj ]
                     if cat_weight_name not in weights_copy:
                         weights_copy[cat_weight_name] = torch.empty(
-                            (loaded_weight.shape[0] * 2,
-                             loaded_weight.shape[1]),
-                            dtype=torch.float16)
-                    # 2. copy values
+                            (loaded_weight.shape[0] * 2, loaded_weight.shape[1]),
+                            dtype=torch.float16
+                        )
+                    # 2. 权重复制
                     cat_weight = weights_copy[cat_weight_name]
                     shard_size = gate_up_shard_size
                     for tp_rank in range(tp_size):
-                        # print(
-                        #     f"### copy from {name}: [{shard_size * tp_rank}:{shard_size*(tp_rank+1)}] to "
-                        #     f"{cat_weight_name} [{stride_id*shard_size + tp_rank*shard_size*2}:"
-                        #     f"{(stride_id+1)*shard_size+tp_rank*shard_size*2}]\n"
-                        # )
-                        # 根据stride_id偏移和tp偏移复制到相应位置
+                        # 根据tp偏移加stride_id偏移复制到相应位置
                         tp_offset = tp_rank * per_rank_gate_up_proj_size
-                        cat_weight[stride_id * shard_size + tp_offset: (stride_id + 1) * shard_size + tp_offset].copy_(
-                                        loaded_weight[shard_size * tp_rank: shard_size * (tp_rank + 1)]) # 投影矩阵在该GPU上的切片
+                        cat_weight[tp_offset + stride_id * shard_size: tp_offset + (stride_id + 1) * shard_size].copy_(
+                            loaded_weight[tp_rank * shard_size: (tp_rank + 1) * shard_size]
+                        ) # 投影矩阵在该GPU上的切片
                     del weights_copy[name]
                     is_gate_up_weight = True
                     break
                 if is_gate_up_weight:
                     continue
         else:
-            raise RuntimeError("Only Llama supported now") # 出现非Attention/MLP的层
+            raise RuntimeError("Only Llama supported now")
         return weights_copy
 
 
