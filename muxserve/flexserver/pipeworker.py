@@ -61,6 +61,7 @@ class PipeWorker(Worker):
 
     @classmethod
     def pipeline_split(cls, num_hidden_layers: int, pipeline_parallel_size: int):
+        """在流水线上划分每一段的层数"""
         num_layer_per_part = num_hidden_layers // pipeline_parallel_size
         partition = [num_layer_per_part] * pipeline_parallel_size
         if num_hidden_layers % pipeline_parallel_size == pipeline_parallel_size - 1:

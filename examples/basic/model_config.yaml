@@ -24,11 +24,11 @@ models:
     model_dtype: fp16
   -
     name: llm-2
-    model: /data/lrc/workspace/huggyllama/llama-7b
+    model: /data/lrc/workspace/huggyllama/llama-13b
     tensor_parallel_size: 2
     pipeline_parallel_size: 1
     placement:
-      - [0, 1,]
+      - [0, 1]
     mps_percentage: [100, 40]
     model_dtype: fp16
 workloads:

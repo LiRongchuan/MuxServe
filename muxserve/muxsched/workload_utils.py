@@ -14,7 +14,7 @@ from abc import ABC, abstractmethod
 from collections import defaultdict, namedtuple
 from transformers import PreTrainedTokenizerBase
 from vllm.transformers_utils.tokenizer import get_tokenizer
-from typing import Any, List, Tuple, Sequence, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 DEFAULT_WARMUP = 10
 DEFAULT_DATASET_PATH = "/data/lrc/workspace/dataset/ShareGPT_Vicuna_unfiltered/ShareGPT_V3_unfiltered_cleaned_split.json"

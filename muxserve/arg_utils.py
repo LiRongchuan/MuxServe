@@ -183,7 +183,7 @@ class MuxServeArgs:
                 continue
             job_cfg = JobConfig(
                 name=model["name"],
-                model=model["model"],
+                model_path=model["model"],
                 pipeline_parallel_size=model["pipeline_parallel_size"],
                 tensor_parallel_size=model["tensor_parallel_size"],
                 placement=model["placement"],

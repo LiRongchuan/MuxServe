@@ -159,7 +159,7 @@ class MuxScheduler:
         time.sleep(5)
         for model_id, job_config in enumerate(self.muxserve_config.job_configs):
             model_name = job_config.name
-            self._name_to_model[model_name] = job_config.model
+            self._name_to_model[model_name] = job_config.model_path
             self.pipeline_parallel_size = job_config.pipeline_parallel_size
             # self.max_num_seqs[model_name] = self.muxserve_config.max_num_seqs
             self.max_num_seqs[model_name] = job_config.max_num_seqs
@@ -182,7 +182,7 @@ class MuxScheduler:
                     proc = launch_flexserver_process(
                         model_id,
                         model_name,
-                        job_config.model,
+                        job_config.model_path,
                         self.muxserve_config.nnodes,
                         self.muxserve_config.nproc_per_node,
                         job_config.pipeline_parallel_size,
@@ -239,7 +239,7 @@ class MuxScheduler:
 
         for job_config in self.muxserve_config.job_configs:
             model_name = job_config.name
-            model_config = AutoConfig.from_pretrained(job_config.model)
+            model_config = AutoConfig.from_pretrained(job_config.model_path)
             tensor_parallel_size = job_config.tensor_parallel_size
             num_heads = model_config.num_attention_heads // tensor_parallel_size
             partition = PipeWorker.pipeline_split(
@@ -1162,7 +1162,7 @@ class MuxScheduler:
         for job_config in self.muxserve_config.job_configs:
             model_name = job_config.name
             self.sched_dict[model_name] = {}
-            self.sched_dict[model_name]["model_name"] = job_config.model
+            self.sched_dict[model_name]["model_name"] = job_config.model_path
             self.sched_dict[model_name]["mps"] = job_config.mps_percentage
             self.sched_dict[model_name]["first_token_latency"] = 0
             self.sched_dict[model_name]["output_per_token_latency"] = 0
